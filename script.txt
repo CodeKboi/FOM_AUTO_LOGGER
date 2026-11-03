@@ -1,0 +1,153 @@
+function checkToolActivity() {
+  // --- CONFIGURATION ---
+  const CALENDAR_ID = '<add calendar id>';
+  const NOTIFICATION_EMAIL = '<which email to notify>';
+  
+  // Sheet column mappings (1-indexed)
+  const TOOL_NAME_COL = 2;       // Column B
+  const INACTIVITY_TIME_COL = 3; // Column C
+  const CURRENT_STATUS_COL = 4;  // Column D
+  const LAST_USED_COL = 5;       // Column E
+  const REMINDER_DAYS_COL = 6;   // Column F
+  const CATEGORY_COL = 7;        // Column G
+  
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const calendar = CalendarApp.getCalendarById(CALENDAR_ID);
+  
+  if (!calendar) {
+    Logger.log("Error: Could not access calendar with ID: " + CALENDAR_ID);
+    return;
+  }
+
+  // Define "Yesterday" time range (Start to End of Yesterday)
+  const today = new Date();
+  const yesterdayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1, 0, 0, 0);
+  const yesterdayEnd = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1, 23, 59, 59);
+
+  // Fetch events from yesterday
+  const yesterdayEvents = calendar.getEvents(yesterdayStart, yesterdayEnd);
+  
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return; // No data rows
+  
+  // Fetch columns A through G
+  const range = sheet.getRange(2, 1, lastRow - 1, 7);
+  const data = range.getValues();
+
+  // -------------------------------------------------------------
+  // PASS 1: Check yesterday's usage & update Column E (Last Used)
+  // -------------------------------------------------------------
+  for (let i = 0; i < data.length; i++) {
+    const row = data[i];
+    const toolName = String(row[TOOL_NAME_COL - 1]).trim();
+    const currentStatus = String(row[CURRENT_STATUS_COL - 1]).trim();
+
+    if (!toolName) continue;
+
+    const wasAnytimeAccess = currentStatus.toLowerCase() === 'anytime';
+    const wasUsedYesterday = yesterdayEvents.some(event => 
+      event.getTitle().toLowerCase().includes(toolName.toLowerCase())
+    );
+
+    const rowNum = i + 2;
+
+    if (!wasAnytimeAccess) {
+      // If not anytime access, keep last used up-to-date
+      sheet.getRange(rowNum, LAST_USED_COL).setValue(yesterdayStart);
+      data[i][LAST_USED_COL - 1] = yesterdayStart; 
+    } else if (wasUsedYesterday) {
+      // Tool was used yesterday -> update sheet and cache
+      sheet.getRange(rowNum, LAST_USED_COL).setValue(yesterdayStart);
+      data[i][LAST_USED_COL - 1] = yesterdayStart;
+      Logger.log(`Updated Last Used date for: ${toolName}`);
+    }
+  }
+
+  // -------------------------------------------------------------
+  // PASS 2: Group by Category Letter (A, B, C, D, E...)
+  // -------------------------------------------------------------
+  const categories = {};
+
+  for (let i = 0; i < data.length; i++) {
+    const row = data[i];
+    const toolName = String(row[TOOL_NAME_COL - 1]).trim();
+    if (!toolName) continue;
+
+    const inactivityDays = Number(row[INACTIVITY_TIME_COL - 1]);
+    const reminderDays = Number(row[REMINDER_DAYS_COL - 1]);
+    const rawCategory = String(row[CATEGORY_COL - 1] || '').trim().toUpperCase();
+    const lastUsedVal = row[LAST_USED_COL - 1];
+    const lastUsedDate = lastUsedVal ? new Date(lastUsedVal) : null;
+
+    // Blank categories get a unique key so they are evaluated individually
+    const categoryKey = rawCategory !== '' ? rawCategory : `__SOLO_${i}__`;
+
+    let daysInactive = 0;
+    let hasExceeded = false;
+
+    if (lastUsedDate && !isNaN(inactivityDays) && !isNaN(reminderDays)) {
+      const diffInTime = today.getTime() - lastUsedDate.getTime();
+      daysInactive = Math.floor(diffInTime / (1000 * 3600 * 24));
+      const thresholdDays = inactivityDays - reminderDays;
+      hasExceeded = daysInactive >= thresholdDays;
+    }
+
+    if (!categories[categoryKey]) {
+      categories[categoryKey] = {
+        name: rawCategory,
+        isSolo: rawCategory === '',
+        tools: []
+      };
+    }
+
+    categories[categoryKey].tools.push({
+      toolName: toolName,
+      inactivityDays: inactivityDays,
+      reminderDays: reminderDays,
+      lastUsedDate: lastUsedDate,
+      daysInactive: daysInactive,
+      hasExceeded: hasExceeded
+    });
+  }
+
+  // -------------------------------------------------------------
+  // PASS 3: Send Email only if ALL tools in that category exceeded
+  // -------------------------------------------------------------
+  for (const catKey in categories) {
+    const group = categories[catKey];
+    
+    // Check if EVERY tool in this letter group exceeded its threshold
+    const allExceeded = group.tools.length > 0 && group.tools.every(t => t.hasExceeded);
+
+    if (allExceeded) {
+      let subject = "";
+      let body = "Hello,\n\n";
+
+      if (group.isSolo) {
+        const tool = group.tools[0];
+        subject = `Inactivity Warning: ${tool.toolName}`;
+        body += `The tool "${tool.toolName}" has been inactive for ${tool.daysInactive} days.\n\n` +
+                `- Inactivity Threshold: ${tool.inactivityDays} days\n` +
+                `- Reminder Lead Time: ${tool.reminderDays} days\n` +
+                `- Last Used Date: ${tool.lastUsedDate ? tool.lastUsedDate.toDateString() : 'Never'}\n\n` +
+                `Please do an extra slot.`;
+      } else {
+        subject = `Inactivity Warning: Category [${group.name}] (${group.tools.length} Tools)`;
+        body += `All tools under Category "${group.name}" have surpassed their inactivity threshold:\n\n`;
+
+        group.tools.forEach(tool => {
+          body += `• ${tool.toolName}:\n` +
+                  `  - Inactive for: ${tool.daysInactive} days\n` +
+                  `  - Threshold: ${tool.inactivityDays - tool.reminderDays} days (${tool.inactivityDays} - ${tool.reminderDays})\n` +
+                  `  - Last Used: ${tool.lastUsedDate ? tool.lastUsedDate.toDateString() : 'Never'}\n\n`;
+        });
+
+        body += `Please book/use at least one tool from this category.`;
+      }
+
+      // If Gmail is restricted in your domain, route via your Power Automate / external API hook here
+      MailApp.sendEmail(NOTIFICATION_EMAIL, subject, body);
+      Logger.log(`Email sent for category/tool: ${group.name || group.tools[0].toolName}`);
+    }
+  }
+}
