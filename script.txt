@@ -44,7 +44,7 @@ function checkToolActivity() {
 
     if (!toolName) continue;
 
-    const wasAnytimeAccess = currentStatus.toLowerCase() === 'anytime';
+    const wasAnytimeAccess = currentStatus.toLowerCase() === 'any time user';
     const wasUsedYesterday = yesterdayEvents.some(event => 
       event.getTitle().toLowerCase().includes(toolName.toLowerCase())
     );
